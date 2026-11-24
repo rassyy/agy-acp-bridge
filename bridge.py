@@ -32,6 +32,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AGY = os.environ.get("AGY_BIN", "/root/.local/bin/agy")
 PORT = int(os.environ.get("AGY_BRIDGE_PORT", "20130"))
+# Model used when the caller omits `model`. Defaults to claude-sonnet-4-6;
+# override via AGY_DEFAULT_MODEL for accounts that expose a different model set.
+DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "claude-sonnet-4-6")
 # --app-data-dir rejects absolute paths ("must not be absolute"): it is a
 # directory NAME resolved under ~/.gemini. So each profile is a name, not a path.
 APPDATA_ROOT = os.environ.get("AGY_APPDATA_ROOT", "/root/.gemini")
@@ -50,7 +53,8 @@ PLAIN_RETRY_NUDGE = ("Do not use any tool for this. Answer the user's "
                      "know or can see in the conversation.")
 
 TOOL_RETRY_NUDGE = ("You used your own built-in tool. Built-in tools are NOT "
-                    "available in this mode. Fulfil the user's request by emitting "
+                    "available in this mode. Fulfil ONLY the latest [CURRENT USER MESSAGE] "
+                    "(never re-answer or re-run earlier answered turns from history) by emitting "
                     "the call as a <tool_call>{...}</tool_call> block in OpenAI "
                     "function-call shape, with arguments as a JSON string. Do not "
                     "run anything else; just emit the block.")
@@ -61,6 +65,10 @@ WORKERS_PER_PROFILE = max(1, int(os.environ.get("AGY_WORKERS_PER_PROFILE", "1"))
 SESSION_CACHE = os.environ.get("AGY_SESSION_CACHE", "1") != "0"
 SESSION_IDLE = int(os.environ.get("AGY_SESSION_IDLE", "900"))
 SESSION_MAX = max(1, int(os.environ.get("AGY_SESSION_MAX", "4")))
+# History replay caps (on cache miss): keep old tool outputs short and bound
+# replay size so agy never truncates the tail ([CURRENT USER MESSAGE]).
+HIST_TOOL_CHARS = max(200, int(os.environ.get("AGY_HIST_TOOL_CHARS", "1200")))
+HIST_BODY_MAX_CHARS = max(16000, int(os.environ.get("AGY_HIST_BODY_MAX_CHARS", "110000")))
 # Spawn the primary profile at boot instead of on the first request.
 PREWARM = os.environ.get("AGY_PREWARM", "1") != "0"
 PREWARM_PROFILES = max(0, int(os.environ.get("AGY_PREWARM_PROFILES", "1")))
@@ -193,7 +201,14 @@ def message_hash(m):
             else:
                 parts.append(str(t) + ":" + json.dumps(p, sort_keys=True)[:200])
         c = "\n".join(parts)
-    return hashlib.sha1((role + "\x00" + str(c or "")).encode(
+    extra = ""
+    if m.get("tool_calls"):
+        extra += "\x00tc:" + json.dumps(m["tool_calls"], sort_keys=True, ensure_ascii=False)
+    if m.get("tool_call_id"):
+        extra += "\x00tcid:" + str(m["tool_call_id"])
+    if m.get("name"):
+        extra += "\x00name:" + str(m["name"])
+    return hashlib.sha1((role + "\x00" + str(c or "") + extra).encode(
         "utf-8", "replace")).hexdigest()
 
 
@@ -232,6 +247,21 @@ class AgyWorker:
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
+
+    def close(self):
+        for e in list(self.sessions.values()):
+            self._clear_tool_mode(e["sid"])
+        self.sessions.clear()
+        proc = getattr(self, "proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
 
     # ---- ACP session cache ------------------------------------------------
     # Every request used to pay session/new + set_model + the WHOLE transcript
@@ -428,9 +458,9 @@ class AgyWorker:
                         self.sessions[sess_key]["last"] = time.time()
                         reused = True
                         self.stats["hit"] += 1
-                        prompt_text, images = flatten(segments[cut:])
+                        prompt_text, images = flatten(segments[cut:], is_tail=True)
                     else:
-                        prompt_text, images = flatten(segments)
+                        prompt_text, images = flatten(segments, is_tail=False)
                         self.stats["miss"] += 1
                 if suffix:
                     prompt_text += suffix
@@ -647,17 +677,25 @@ class ProfilePool:
 
     def ensure(self, profile):
         with self.lock:
-            ws = self.workers.get(profile)
-            if ws and all(w.alive() for w in ws):
-                return ws
-            ws = []
-            for i in range(WORKERS_PER_PROFILE):
+            ws = self.workers.get(profile) or []
+            alive = []
+            for w in ws:
+                if w.alive():
+                    alive.append(w)
+                else:
+                    w.close()
+            while len(alive) > WORKERS_PER_PROFILE:
+                alive.pop().close()
+            if len(alive) == WORKERS_PER_PROFILE:
+                self.workers[profile] = alive
+                return alive
+            for i in range(len(alive), WORKERS_PER_PROFILE):
                 try:
-                    ws.append(AgyWorker(profile, i))
+                    alive.append(AgyWorker(profile, i))
                 except Exception as e:
                     log(f"[{profile}] worker spawn failed: {e}")
-            self.workers[profile] = ws
-            return ws
+            self.workers[profile] = alive
+            return alive
 
     # ---- ordering: one primary, the rest are fallback -------------------
     def primary(self):
@@ -666,7 +704,7 @@ class ProfilePool:
             return forced
         saved = (self.tested.get("_primary") or {}).get("profile")
         if saved and saved in list_profiles() and \
-                self.tested.get(saved, {}).get("status") not in ("tos", "verify"):
+                self.tested.get(saved, {}).get("status") not in ("tos", "verify", "quota"):
             return saved
         for p, st in self.tested.items():
             if p != "_primary" and st.get("status") == "ok":
@@ -677,7 +715,7 @@ class ProfilePool:
         """Every usable profile, primary first. Fallbacks only run when the
         primary fails, so the same account is not hammered concurrently but
         also does not sit idle while a healthy one exists."""
-        bad = {"tos", "verify"}
+        bad = {"tos", "verify", "quota"}
         names = list_profiles()
         now = time.time()
 
@@ -714,6 +752,21 @@ POOL = ProfilePool()
 
 BANNER_TOS = "terms of service"
 BANNER_VERIFY = ("verification required", "verify your account")
+BANNER_QUOTA = ("individual quota reached", "please upgrade your subscription")
+
+
+def is_quota_banner(text):
+    """Match an upstream quota banner only when it is the response itself.
+
+    Quota wording can appear in ordinary explanations; searching anywhere in
+    generated text falsely parks the entire profile.
+    """
+    candidate = text.strip().lower().lstrip("\"'`*_>")
+    if candidate.startswith("⚠️"):
+        candidate = candidate[len("⚠️"):].lstrip()
+    elif candidate.startswith("⚠"):
+        candidate = candidate[1:].lstrip()
+    return any(candidate.startswith(b) for b in BANNER_QUOTA)
 
 
 def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None, images=None,
@@ -728,6 +781,8 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
     handing the banner back to the caller as if it were an answer.
     """
     errors = []
+    req_hashes = (tuple(message_hash(m) for m in segments)
+                  if segments is not None and SESSION_CACHE else None)
     for name in POOL.order(prefer):
         worker = None
         try:
@@ -735,7 +790,12 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
             if not ws:
                 errors.append(f"{name}: no live worker")
                 continue
-            worker = next((w for w in ws if not w.busy), ws[0])
+            worker = None
+            if req_hashes is not None:
+                worker = next((w for w in ws if not w.busy and
+                               w._find_session(req_hashes, model or "")[0] is not None), None)
+            if worker is None:
+                worker = next((w for w in ws if not w.busy), ws[0])
             if state is not None:
                 state["profile"] = name
                 state["fallback"] = bool(errors)
@@ -751,7 +811,7 @@ def turn_with_fallback(prompt, model=None, prefer=None, timeout=None, state=None
         except Exception as e:
             msg = str(e)
             low = msg.lower()
-            if "tos banner" not in low and "verify banner" not in low:
+            if "tos banner" not in low and "verify banner" not in low and "quota banner" not in low:
                 log(f"[{name}] turn failed, falling back: {msg[:160]}")
                 if "429" in msg or "quota" in low or "rate" in low or "busy" in low:
                     POOL.cooldown(name, 60 if "busy" in low else 300, msg)
@@ -786,6 +846,9 @@ def _drain(gen, name):
         if settled and any(b in low for b in BANNER_VERIFY):
             POOL.mark(name, "verify", buf.strip()[:160])
             raise RuntimeError("verify banner")
+        if settled and is_quota_banner(buf):
+            # Quota can be model-specific; do not park the whole profile.
+            raise RuntimeError("quota banner")
         if settled:
             yield buf
     if buf and not settled:
@@ -796,6 +859,9 @@ def _drain(gen, name):
         if any(b in low for b in BANNER_VERIFY):
             POOL.mark(name, "verify", buf.strip()[:160])
             raise RuntimeError("verify banner")
+        if is_quota_banner(buf):
+            # Quota can be model-specific; do not park the whole profile.
+            raise RuntimeError("quota banner")
         yield buf
 
 
@@ -830,8 +896,9 @@ def tools_prompt(tools, tool_choice=None):
     out = ("\n\n[Available functions]\n" + json.dumps(specs, ensure_ascii=False) +
            "\n\nTo call one, emit <tool_call>...</tool_call> blocks: one JSON object per call, "
            "exactly in OpenAI function-call shape, e.g.\n" + example +
-           "\narguments MUST be a JSON string. Several blocks and prose around them "
-           "are fine. You have NO built-in tools in this mode: run_command, read_file, "
+           "\narguments MUST be a JSON string. Several blocks are fine; emit ONLY the "
+           "<tool_call> blocks with no prose when calling tools, and wait for the tool "
+           "results before writing your reply. You have NO built-in tools in this mode: run_command, read_file, "
            "search and every other internal tool are unavailable and must not be used. "
            "The functions above are the only way to act. If no function is needed, "
            "answer in plain text with no tool_call block.]")
@@ -1035,10 +1102,29 @@ def _image_block(part):
     return {"type": "image", "data": url, "mimeType": part.get("mimeType") or "image/png"}
 
 
-def flatten(messages):
-    """Return (prompt_text, image_blocks). Images used to be silently dropped,
-    which is why the agent answered that it could not see the picture."""
-    sys_parts, convo, images = [], [], []
+def _format_tool_calls(tcalls):
+    out = []
+    for tc in tcalls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name") or tc.get("name") or "tool"
+        args = fn.get("arguments", "{}")
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        if len(args) > 500:
+            args = args[:500] + "...(truncated)"
+        tid = tc.get("id") or ""
+        head = f"[Called tool {name}" + (f" id={tid}" if tid else "") + f": {args}]"
+        out.append(head)
+    return "\n".join(out)
+
+
+def flatten(messages, is_tail=False):
+    """Return (prompt_text, image_blocks). Preserve assistant tool_calls, label
+    tool outputs distinctly from User turns, and isolate the latest user turn
+    so replayed history never hijacks the response."""
+    sys_parts, items, images = [], [], []
     for m in messages:
         role = m.get("role", "user")
         c = m.get("content")
@@ -1058,13 +1144,66 @@ def flatten(messages):
             text = "\n".join(texts)
         else:
             text = c or ""
-        if role == "system":
+        if role in ("system", "developer"):
             sys_parts.append(text)
         elif role == "assistant":
-            convo.append(f"Assistant: {text}")
+            tc_str = _format_tool_calls(m.get("tool_calls"))
+            combined = "\n".join(x for x in (text, tc_str) if x)
+            items.append(("assistant", f"Assistant: {combined}"))
+        elif role == "tool":
+            label = m.get("name") or m.get("tool_call_id") or "tool"
+            items.append(("tool", f"Tool result ({label}): {text}"))
         else:
-            convo.append(f"User: {text}")
-    body = "\n\n".join(convo).strip()
+            items.append(("user", text))
+    last_user = next((i for i in range(len(items) - 1, -1, -1)
+                      if items[i][0] == "user"), None)
+    if last_user is not None:
+        if not is_tail and last_user > 0:
+            def _hist_entry(r, t):
+                if r == "user":
+                    return f"User: {t}"
+                if r == "tool" and len(t) > HIST_TOOL_CHARS:
+                    head = max(200, HIST_TOOL_CHARS - 350)
+                    tail = max(0, HIST_TOOL_CHARS - head)
+                    cut_n = len(t) - head - tail
+                    return (t[:head] + f"\n...({cut_n} chars omitted in history)...\n"
+                            + (t[-tail:] if tail else ""))
+                return t
+            hist = [_hist_entry(r, t) for r, t in items[:last_user]]
+            curr = [
+                f"[CURRENT USER MESSAGE — RESPOND ONLY TO THIS]\nUser: {t}" if idx == 0 else t
+                for idx, (r, t) in enumerate(items[last_user:])
+            ]
+            curr_block = "\n\n".join(curr) + "\n\n[Respond ONLY to the CURRENT USER MESSAGE above.]"
+            sys_len = len("[System instruction]\n" + "\n".join(sys_parts) + "\n\n") if sys_parts else 0
+            overhead = sys_len + len(curr_block) + 160
+            hist_budget = max(4000, HIST_BODY_MAX_CHARS - overhead)
+            omitted = 0
+            while hist and len("\n\n".join(hist)) > hist_budget:
+                hist.pop(0)
+                omitted += 1
+            if omitted:
+                hist.insert(0, f"[...{omitted} earlier message(s) omitted to fit context...]")
+            body = ("[CONVERSATION HISTORY — ALREADY ANSWERED, DO NOT RE-ANSWER OR RE-EXECUTE]\n\n"
+                    + "\n\n".join(hist)
+                    + "\n\n[END OF CONVERSATION HISTORY]\n\n"
+                    + curr_block)
+        else:
+            parts = []
+            for i, (r, t) in enumerate(items):
+                if i == last_user:
+                    parts.append(f"[CURRENT USER MESSAGE — RESPOND ONLY TO THIS]\nUser: {t}")
+                elif r == "user":
+                    parts.append(f"User: {t}")
+                else:
+                    parts.append(t)
+            body = "\n\n".join(parts) + "\n\n[Respond ONLY to the CURRENT USER MESSAGE above.]"
+    else:
+        parts = [f"User: {t}" if r == "user" else t for r, t in items]
+        body = "\n\n".join(parts).strip()
+        if is_tail and body:
+            body += "\n\n[Continue fulfilling ONLY the current user request above using these tool results.]"
+    body = body.strip()
     if sys_parts:
         body = "[System instruction]\n" + "\n".join(sys_parts) + "\n\n" + body
     return body, images
@@ -1132,7 +1271,7 @@ el.innerHTML=d.logins.map(l=>'<div style="margin:8px 0"><b>'+l.profile+'</b><div
 '<input id=c_'+l.id+' placeholder="paste code"><button onclick="fill(\''+l.id+'\')">submit</button></div>').join('')}
 async function fill(id){const code=document.getElementById('c_'+id).value.trim();
 const r=await j('/admin/login/complete',{loginId:id,code});alert(r.ok?('logged in: '+r.detail):('failed: '+r.detail));running();load()}
-async function test(name){const r=await j('/admin/test',{profile:name,model:'claude-sonnet-4-6'});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
+async function test(name){const r=await j('/admin/test',{profile:name});alert((r.ok?'OK: ':'FAIL: ')+r.detail);load()}
 load();running();setInterval(running,4000);
 </script></body></html>"""
 
@@ -1253,7 +1392,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/admin/test"):
             b = self._body()
             prof = b.get("profile") or "default"
-            model = b.get("model") or "claude-sonnet-4-6"
+            model = b.get("model") or DEFAULT_MODEL
             try:
                 ws = [w for w in POOL.ensure(prof) if w.alive()]
                 if not ws:
@@ -1265,6 +1404,8 @@ class Handler(BaseHTTPRequestHandler):
                     status = "tos"
                 elif "verification required" in low or "verify your account" in low:
                     status = "verify"     # alive but needs Google account verification
+                elif is_quota_banner(text):
+                    status = "model_quota"  # only this model is out; keep profile usable
                 elif not text.strip():
                     status = "error"
                 else:
@@ -1299,7 +1440,7 @@ class Handler(BaseHTTPRequestHandler):
         created = int(time.time())
         # agy's session default is a slow gemini tier; pin the fast model when
         # callers omit `model`. Explicit model ids still pass through verbatim.
-        model = raw_model or "claude-sonnet-4-6"
+        model = raw_model or DEFAULT_MODEL
         prof = prefer or "?"
         state = {}
         gen = None
@@ -1320,8 +1461,9 @@ class Handler(BaseHTTPRequestHandler):
                 text, finish = apply_output_limits(text, max_tokens, stop)
                 if tcalls:
                     finish = "tool_calls"
+                    text = ""
                 prof = state.get("profile", prof)
-                message = {"role": "assistant", "content": text}
+                message = {"role": "assistant", "content": None if tcalls else text}
                 if tcalls:
                     message["tool_calls"] = tcalls
                 return self._json(200, {
@@ -1364,6 +1506,7 @@ class Handler(BaseHTTPRequestHandler):
                 text, finish = apply_output_limits(text, max_tokens, stop)
                 if tcalls:
                     finish = "tool_calls"
+                    text = ""
                 if text:
                     sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                          "model": raw_model or "agy", "profile": state.get("profile"),

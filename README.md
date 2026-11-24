@@ -227,6 +227,9 @@ an upstream anchor moved instead of half-applying.
 | `AGY_SESSION_IDLE` | `900` | seconds before an idle session is closed |
 | `AGY_SESSION_MAX` | `4` | live sessions per worker |
 | `AGY_TOOL_RETRIES` | `1` | in-session corrections per turn |
+| `AGY_DEFAULT_MODEL` | `claude-sonnet-4-6` | default model when `model` is omitted |
+| `AGY_HIST_TOOL_CHARS` | `1200` | max chars per historical tool result on replay |
+| `AGY_HIST_BODY_MAX_CHARS` | `110000` | max replay body chars before dropping oldest history |
 
 ## Layout
 
