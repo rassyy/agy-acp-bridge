@@ -606,7 +606,9 @@ class AgyWorker:
                             else:
                                 log(f"[{self.profile}] EMPTY turn, updates={seen}")
                                 if thoughts:
-                                    yield "".join(thoughts)
+                                    thought_text = strip_tool_residue("".join(thoughts))
+                                    if thought_text:
+                                        yield thought_text
                         yield {"__done__": True}
                         return
             finally:
@@ -906,6 +908,20 @@ def _strip_spans(text, spans):
     if cur < len(text):
         parts.append(text[cur:])
     return "\n".join(p.strip() for p in parts if p and p.strip()).strip()
+
+
+# Some Gemini tool-call turns emit HTML closing tags as assistant content
+# alongside tool_calls (e.g. "</span>"). It is UI residue, never an answer.
+# Strip it only when the whole string is closing tags, so legitimate HTML
+# snippets in a normal answer are left alone.
+HTML_CLOSE_RESIDUE_RE = re.compile(
+    r"^[ \t\r\n]*(?:</[A-Za-z][A-Za-z0-9:-]*>[ \t\r\n]*)+$")
+
+
+def strip_tool_residue(text):
+    if not isinstance(text, str):
+        return text
+    return "" if HTML_CLOSE_RESIDUE_RE.match(text) else text
 
 
 def _parse_bare_calls(text, allowed):
@@ -1359,6 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
                 if tools and not tcalls:
                     tcalls, text = extract_tool_calls(text, allowed)
                 text, finish = apply_output_limits(text, max_tokens, stop)
+                text = strip_tool_residue(text)
                 if tcalls:
                     finish = "tool_calls"
                 prof = state.get("profile", prof)
@@ -1403,6 +1420,7 @@ class Handler(BaseHTTPRequestHandler):
                 if tools and not tcalls:
                     tcalls, text = extract_tool_calls(text, allowed)
                 text, finish = apply_output_limits(text, max_tokens, stop)
+                text = strip_tool_residue(text)
                 if tcalls:
                     finish = "tool_calls"
                 if text:
@@ -1417,6 +1435,9 @@ class Handler(BaseHTTPRequestHandler):
                         tcalls = piece["__tools__"]
                         continue
                     if not isinstance(piece, str):
+                        continue
+                    piece = strip_tool_residue(piece)
+                    if not piece:
                         continue
                     sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                          "model": raw_model or "agy", "profile": state.get("profile"),

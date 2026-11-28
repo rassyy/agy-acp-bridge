@@ -193,6 +193,10 @@ an upstream anchor moved instead of half-applying.
 6. `session/set_model` is undocumented but implemented by `agy`. Call it and
    **fail the turn when it rejects the model** — swallowing the error answers
    HTTP 200 from `agy`'s fallback model and lies about which model ran.
+6b. Some Gemini tool-call turns emit orphan HTML closing tags as assistant
+   content (`</span>`, `</span></span>`) next to `tool_calls`. The bridge drops
+   content that is only closing tags, in stream and non-stream paths, so the
+   client never shows UI residue instead of an answer.
 7. `max_tokens` and `stop` are applied downstream: the model still generates in
    full, so they save output, not time.
 
